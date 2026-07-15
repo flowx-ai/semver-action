@@ -4,6 +4,29 @@ const _ = require('lodash')
 const cc = require('@conventional-commits/parser')
 const semver = require('semver')
 
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
+
+function isRetryable (err) {
+  if (err.status && RETRYABLE_STATUS_CODES.has(err.status)) return true
+  if (err.message && /ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|socket hang up/i.test(err.message)) return true
+  return false
+}
+
+async function retryRequest (fn, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (attempt === maxRetries || !isRetryable(err)) {
+        throw err
+      }
+      const delay = Math.pow(2, attempt) * 1000
+      core.info(`Request failed (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}. Retrying in ${delay}ms...`)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    }
+  }
+}
+
 async function main () {
   const token = core.getInput('token')
   const branch = core.getInput('branch')
@@ -44,38 +67,50 @@ async function main () {
   if (!fromTag) {
     // GET LATEST + PREVIOUS TAGS
 
-    const tagsRaw = await gh.graphql(`
-      query lastTags (
-        $owner: String!
-        $repo: String!
-        $fetchLimit: Int
-        ) {
-        repository (
-          owner: $owner
-          name: $repo
-          ) {
-          refs(
-            first: $fetchLimit
-            refPrefix: "refs/tags/"
-            orderBy: { field: TAG_COMMIT_DATE, direction: DESC }
+    let hasNextPage = true;
+    let cursor = null;
+    const allTags = [];
+  
+    while (hasNextPage) {
+      const result = await retryRequest(() => gh.graphql(
+        `
+        query lastTags($owner: String!, $repo: String!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            refs(
+              first: 100
+              after: $cursor
+              refPrefix: "refs/tags/"
+              orderBy: { field: TAG_COMMIT_DATE, direction: DESC }
             ) {
-            nodes {
-              name
-              target {
-                oid
+              nodes {
+                name
+                target {
+                  oid
+                }
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
               }
             }
           }
         }
-      }
-    `,
-    {
-      owner,
-      repo,
-      fetchLimit
-    })
-
-    const tagsList = _.get(tagsRaw, 'repository.refs.nodes', [])
+      `,
+        {
+          owner,
+          repo,
+          cursor
+        }
+      ));
+  
+      const refs = result.repository.refs;
+      allTags.push(...refs.nodes);
+      hasNextPage = refs.pageInfo.hasNextPage;
+      cursor = refs.pageInfo.endCursor;
+    }
+  
+    core.info(`Fetched a total of : ${allTags.length} tags`)
+    const tagsList = allTags
     if (tagsList.length < 1) {
       if (fallbackTag && semver.valid(fallbackTag)) {
         core.info(`Using fallback tag: ${fallbackTag}`)
@@ -131,7 +166,7 @@ async function main () {
   } else {
     // GET SPECIFIC TAG
 
-    const tagRaw = await gh.graphql(`
+    const tagRaw = await retryRequest(() => gh.graphql(`
       query singleTag ($owner: String!, $repo: String!, $tag: String!) {
         repository (owner: $owner, name: $repo) {
           ref(qualifiedName: $tag) {
@@ -146,7 +181,7 @@ async function main () {
       owner,
       repo,
       tag: `refs/tags/${prefix}${fromTag}`
-    })
+    }))
 
     latestTag = _.get(tagRaw, 'repository.ref')
 
@@ -177,13 +212,13 @@ async function main () {
   do {
     hasMoreCommits = false
     curPage++
-    const commitsRaw = await gh.rest.repos.compareCommitsWithBasehead({
+    const commitsRaw = await retryRequest(() => gh.rest.repos.compareCommitsWithBasehead({
       owner,
       repo,
       basehead: `${prefix}${latestTag.name}...${branch}`,
       page: curPage,
       per_page: 100
-    })
+    }))
     totalCommits = _.get(commitsRaw, 'data.total_commits', 0)
     const rangeCommits = _.get(commitsRaw, 'data.commits', [])
     commits.push(...rangeCommits)
