@@ -5,6 +5,7 @@ const cc = require('@conventional-commits/parser')
 const semver = require('semver')
 
 const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504])
+const MAX_RATE_LIMIT_WAIT_MS = 60000
 
 function isRetryable (err) {
   if (err.status && RETRYABLE_STATUS_CODES.has(err.status)) return true
@@ -12,11 +13,50 @@ function isRetryable (err) {
   return false
 }
 
+// A GraphQL rate limit arrives as HTTP 200 with an errors array, so it has no
+// status code to match on.
+function isRateLimited (err) {
+  const errors = err.errors || (err.response && err.response.errors) || []
+  if (errors.some(e => e.type === 'RATE_LIMIT' || e.code === 'graphql_rate_limit')) return true
+  return err.status === 403 && /rate limit/i.test(err.message || '')
+}
+
+// Milliseconds to wait before retrying a rate-limited request, or null when the
+// quota resets too far in the future to be worth waiting for.
+function rateLimitWaitMs (err) {
+  const headers = err.headers || {}
+  const retryAfter = Number(headers['retry-after'])
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, MAX_RATE_LIMIT_WAIT_MS)
+  }
+  const reset = Number(headers['x-ratelimit-reset'])
+  if (!Number.isFinite(reset)) return null
+  const waitMs = reset * 1000 - Date.now() + 1000
+  if (waitMs <= 0) return 1000
+  return waitMs > MAX_RATE_LIMIT_WAIT_MS ? null : waitMs
+}
+
+function rateLimitMessage (err) {
+  const headers = err.headers || {}
+  const reset = Number(headers['x-ratelimit-reset'])
+  const resetAt = Number.isFinite(reset) ? new Date(reset * 1000).toISOString() : 'unknown'
+  return `GitHub API rate limit exhausted for this installation (${headers['x-ratelimit-used'] || '?'}/${headers['x-ratelimit-limit'] || '?'} on the ${headers['x-ratelimit-resource'] || 'unknown'} resource). Quota resets at ${resetAt}.`
+}
+
 async function retryRequest (fn, maxRetries = 3) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn()
     } catch (err) {
+      if (isRateLimited(err)) {
+        const waitMs = attempt === maxRetries ? null : rateLimitWaitMs(err)
+        if (waitMs === null) {
+          throw new Error(rateLimitMessage(err))
+        }
+        core.info(`${rateLimitMessage(err)} Waiting ${Math.round(waitMs / 1000)}s before retrying...`)
+        await new Promise(resolve => setTimeout(resolve, waitMs))
+        continue
+      }
       if (attempt === maxRetries || !isRetryable(err)) {
         throw err
       }
@@ -24,6 +64,64 @@ async function retryRequest (fn, maxRetries = 3) {
       core.info(`Request failed (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}. Retrying in ${delay}ms...`)
       await new Promise(resolve => setTimeout(resolve, delay))
     }
+  }
+}
+
+const TAGS_QUERY = `
+  query lastTags($owner: String!, $repo: String!, $cursor: String, $nameFilter: String) {
+    repository(owner: $owner, name: $repo) {
+      refs(
+        first: 100
+        after: $cursor
+        refPrefix: "refs/tags/"
+        query: $nameFilter
+        orderBy: { field: TAG_COMMIT_DATE, direction: DESC }
+      ) {
+        nodes {
+          name
+          target {
+            oid
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`
+
+// Walks tags newest-first and stops at the first one that matches, so a repo
+// with thousands of tags costs one request instead of one per hundred tags.
+async function findLatestTag (gh, owner, repo, { prefix, tagFilterRgx, skipInvalidTags, nameFilter }) {
+  let cursor = null
+  let scanned = 0
+  let isFirstCandidate = true
+
+  for (;;) {
+    const result = await retryRequest(() => gh.graphql(TAGS_QUERY, { owner, repo, cursor, nameFilter }))
+    const refs = result.repository.refs
+
+    for (const tag of refs.nodes) {
+      if (prefix && tag.name.indexOf(prefix) !== 0) continue
+      const name = prefix ? tag.name.slice(prefix.length) : tag.name
+      if (tagFilterRgx && !tagFilterRgx.test(name)) continue
+
+      if (semver.valid(name)) {
+        core.info(`Found matching tag after scanning ${scanned + refs.nodes.length} tags`)
+        return { name, target: tag.target }
+      }
+      if (isFirstCandidate && !skipInvalidTags) return null
+      isFirstCandidate = false
+    }
+
+    scanned += refs.nodes.length
+    if (!refs.pageInfo.hasNextPage) {
+      core.info(`Scanned ${scanned} tags without a match`)
+      return null
+    }
+    cursor = refs.pageInfo.endCursor
   }
 }
 
@@ -39,8 +137,6 @@ async function main () {
   const prefix = core.getInput('prefix') || ''
   const additionalCommits = core.getInput('additionalCommits').split('\n').map(l => l.trim()).filter(l => l !== '')
   const fromTag = core.getInput('fromTag')
-  const maxTagsToFetch = _.toSafeInteger(core.getInput('maxTagsToFetch') || 10)
-  const fetchLimit = (maxTagsToFetch < 1 || maxTagsToFetch > 100) ? 10 : maxTagsToFetch
   const fallbackTag = core.getInput('fallbackTag')
   const tagFilter = core.getInput('tagFilter')
   const scopeList = core.getInput('scopeList').split(',').map(s => s.trim()).filter(s => s !== '')
@@ -67,86 +163,18 @@ async function main () {
   if (!fromTag) {
     // GET LATEST + PREVIOUS TAGS
 
-    let hasNextPage = true;
-    let cursor = null;
-    const allTags = [];
-  
-    while (hasNextPage) {
-      const result = await retryRequest(() => gh.graphql(
-        `
-        query lastTags($owner: String!, $repo: String!, $cursor: String) {
-          repository(owner: $owner, name: $repo) {
-            refs(
-              first: 100
-              after: $cursor
-              refPrefix: "refs/tags/"
-              orderBy: { field: TAG_COMMIT_DATE, direction: DESC }
-            ) {
-              nodes {
-                name
-                target {
-                  oid
-                }
-              }
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-            }
-          }
-        }
-      `,
-        {
-          owner,
-          repo,
-          cursor
-        }
-      ));
-  
-      const refs = result.repository.refs;
-      allTags.push(...refs.nodes);
-      hasNextPage = refs.pageInfo.hasNextPage;
-      cursor = refs.pageInfo.endCursor;
-    }
-  
-    core.info(`Fetched a total of : ${allTags.length} tags`)
-    const tagsList = allTags
-    if (tagsList.length < 1) {
-      if (fallbackTag && semver.valid(fallbackTag)) {
-        core.info(`Using fallback tag: ${fallbackTag}`)
-        latestTag = { name: fallbackTag }
-      } else {
-        return core.setFailed('Couldn\'t find the latest tag. Make sure you have at least one tag created or provide a fallbackTag!')
-      }
-    }
-
     let tagFilterRgx = null
     if (tagFilter) {
       core.info(`Will filter tags based on pattern: ${tagFilter}`)
       tagFilterRgx = new RegExp(tagFilter)
     }
 
-    let idx = 0
-    for (const tag of tagsList) {
-      if (prefix) {
-        if (tag.name.indexOf(prefix) === 0) {
-          tag.name = tag.name.replace(prefix, '')
-        } else {
-          continue
-        }
-      }
-
-      if (tagFilterRgx && !tagFilterRgx.test(tag.name)) {
-        continue
-      }
-
-      if (semver.valid(tag.name)) {
-        latestTag = tag
-        break
-      } else if (idx === 0 && !skipInvalidTags) {
-        break
-      }
-      idx++
+    // Asking the API for only the tags starting with the prefix keeps
+    // monorepos with thousands of tags from paging through all of them.
+    latestTag = await findLatestTag(gh, owner, repo, { prefix, tagFilterRgx, skipInvalidTags, nameFilter: prefix || null })
+    if (!latestTag && prefix) {
+      core.info('No match among the prefixed tags; scanning all tags instead.')
+      latestTag = await findLatestTag(gh, owner, repo, { prefix, tagFilterRgx, skipInvalidTags, nameFilter: null })
     }
 
     if (!latestTag) {
@@ -155,9 +183,9 @@ async function main () {
         latestTag = { name: fallbackTag }
       } else {
         if (prefix) {
-          return core.setFailed(`None of the ${fetchLimit} latest tags are valid semver or match the specified prefix!`)
+          return core.setFailed('No tag matches the specified prefix and is valid semver!')
         } else {
-          return core.setFailed(skipInvalidTags ? `None of the ${fetchLimit} latest tags are valid semver!` : 'Latest tag is invalid (does not conform to semver)!')
+          return core.setFailed(skipInvalidTags ? 'None of the tags are valid semver!' : 'Latest tag is invalid (does not conform to semver)!')
         }
       }
     }
@@ -346,4 +374,6 @@ async function main () {
   outputVersion(next)
 }
 
-main()
+main().catch(err => {
+  core.setFailed(err.message)
+})
