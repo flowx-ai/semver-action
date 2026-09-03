@@ -41,7 +41,7 @@ inputs:
     required: false
     default: ''
   maxTagsToFetch:
-    description: Maximum number of tags to fetch from latest.
+    description: 'Deprecated and ignored: tags are now scanned lazily and the walk stops at the first match.'
     required: false
     default: '10'
   noNewCommitBehavior:
