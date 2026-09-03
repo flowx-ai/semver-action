@@ -37,11 +37,11 @@ This GitHub Action automatically determinate the next release version to use bas
 | `additionalCommits` | A list of additional commit messages to parse in order to calculate semver. | :x: |  |
 | `fallbackTag` | A fallback tag to use if no valid latest tag can be found. The fallback tag must exist already. | :x: |  |
 | `fromTag` | Override the tag to use when comparing against the branch in order to fetch the list of commits. | :x: |  |
-| `maxTagsToFetch` | Maximum number of tags to fetch from latest (between `1` and `100`). | :x: | `10` |
+| `maxTagsToFetch` | How many tags to fetch per request, newest first (between `1` and `100`). Tags are paged until the latest matching one is found, so monorepos holding tags for many services don't need this raised. | :x: | `10` |
 | `noNewCommitBehavior` | Whether to exit with an error *(default)*, a warning, the current version or silently when there are no new commits since the latest tag. (Possible values: `error`, `warn`, `current` or `silent`) | :x: | `error` |
 | `noVersionBumpBehavior` | Whether to exit with an error *(default)*, a warning, silently, the current version or force bump using patch when none of the commits result in a version bump. (Possible values: `error`, `warn`, `current`, `patch` or `silent`) | :x: | `error` |
 | `prefix` | A prefix that will be striped when parsing tags (e.g. `foobar/`). Any other prefix will be ignored. Useful for monorepos. The prefix will be added back to the output values. | :x: |  |
-| `skipInvalidTags` | If set to `true`, will skip tags that are not valid semver until it finds a proper one (up to `maxTagsFetch` from latest). | :x: | `false` |
+| `skipInvalidTags` | If set to `true`, will skip tags that are not valid semver until it finds a proper one. | :x: | `false` |
 | `tagFilter` | If defined, only tags matching the regex pattern will be included (e.g. `^[a-f0-9.]+$`). Use a negative lookahead match to exclude tags (e.g. `^(?!abcd).*$`). When used in conjunction with the prefix option, the prefix is striped first, then the filter is applied. | :x: |  |
 
 ## Outputs

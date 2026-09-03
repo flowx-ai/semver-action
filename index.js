@@ -66,18 +66,31 @@ async function main () {
 
   if (!fromTag) {
     // GET LATEST + PREVIOUS TAGS
+    //
+    // Tags are paged newest-first and scanned as each page arrives, so we stop
+    // requesting pages as soon as the latest matching tag is found. Monorepos
+    // hold tags for every service (tens of thousands), and draining all of them
+    // before scanning cost one sequential request per 100 tags.
 
-    let hasNextPage = true;
-    let cursor = null;
-    const allTags = [];
-  
-    while (hasNextPage) {
+    let tagFilterRgx = null
+    if (tagFilter) {
+      core.info(`Will filter tags based on pattern: ${tagFilter}`)
+      tagFilterRgx = new RegExp(tagFilter)
+    }
+
+    let hasNextPage = true
+    let cursor = null
+    let fetchedTags = 0
+    let fetchedPages = 0
+    let idx = 0
+
+    while (hasNextPage && !latestTag) {
       const result = await retryRequest(() => gh.graphql(
         `
-        query lastTags($owner: String!, $repo: String!, $cursor: String) {
+        query lastTags($owner: String!, $repo: String!, $cursor: String, $first: Int!) {
           repository(owner: $owner, name: $repo) {
             refs(
-              first: 100
+              first: $first
               after: $cursor
               refPrefix: "refs/tags/"
               orderBy: { field: TAG_COMMIT_DATE, direction: DESC }
@@ -99,66 +112,59 @@ async function main () {
         {
           owner,
           repo,
-          cursor
+          cursor,
+          first: fetchLimit
         }
-      ));
-  
-      const refs = result.repository.refs;
-      allTags.push(...refs.nodes);
-      hasNextPage = refs.pageInfo.hasNextPage;
-      cursor = refs.pageInfo.endCursor;
-    }
-  
-    core.info(`Fetched a total of : ${allTags.length} tags`)
-    const tagsList = allTags
-    if (tagsList.length < 1) {
-      if (fallbackTag && semver.valid(fallbackTag)) {
-        core.info(`Using fallback tag: ${fallbackTag}`)
-        latestTag = { name: fallbackTag }
-      } else {
-        return core.setFailed('Couldn\'t find the latest tag. Make sure you have at least one tag created or provide a fallbackTag!')
-      }
-    }
+      ))
 
-    let tagFilterRgx = null
-    if (tagFilter) {
-      core.info(`Will filter tags based on pattern: ${tagFilter}`)
-      tagFilterRgx = new RegExp(tagFilter)
-    }
+      const refs = result.repository.refs
+      fetchedTags += refs.nodes.length
+      fetchedPages++
 
-    let idx = 0
-    for (const tag of tagsList) {
-      if (prefix) {
-        if (tag.name.indexOf(prefix) === 0) {
-          tag.name = tag.name.replace(prefix, '')
-        } else {
+      let stopScanning = false
+      for (const tag of refs.nodes) {
+        if (prefix) {
+          if (tag.name.indexOf(prefix) === 0) {
+            tag.name = tag.name.replace(prefix, '')
+          } else {
+            continue
+          }
+        }
+
+        if (tagFilterRgx && !tagFilterRgx.test(tag.name)) {
           continue
         }
+
+        if (semver.valid(tag.name)) {
+          latestTag = tag
+          break
+        } else if (idx === 0 && !skipInvalidTags) {
+          stopScanning = true
+          break
+        }
+        idx++
       }
 
-      if (tagFilterRgx && !tagFilterRgx.test(tag.name)) {
-        continue
+      if (stopScanning) {
+        break
       }
 
-      if (semver.valid(tag.name)) {
-        latestTag = tag
-        break
-      } else if (idx === 0 && !skipInvalidTags) {
-        break
-      }
-      idx++
+      hasNextPage = refs.pageInfo.hasNextPage
+      cursor = refs.pageInfo.endCursor
     }
+
+    core.info(`Fetched a total of : ${fetchedTags} tags (${fetchedPages} page(s))`)
 
     if (!latestTag) {
       if (fallbackTag && semver.valid(fallbackTag)) {
         core.info(`Using fallback tag: ${fallbackTag}`)
         latestTag = { name: fallbackTag }
+      } else if (fetchedTags < 1) {
+        return core.setFailed('Couldn\'t find the latest tag. Make sure you have at least one tag created or provide a fallbackTag!')
+      } else if (prefix) {
+        return core.setFailed(`None of the ${fetchedTags} tags scanned are valid semver or match the specified prefix!`)
       } else {
-        if (prefix) {
-          return core.setFailed(`None of the ${fetchLimit} latest tags are valid semver or match the specified prefix!`)
-        } else {
-          return core.setFailed(skipInvalidTags ? `None of the ${fetchLimit} latest tags are valid semver!` : 'Latest tag is invalid (does not conform to semver)!')
-        }
+        return core.setFailed(skipInvalidTags ? `None of the ${fetchedTags} tags scanned are valid semver!` : 'Latest tag is invalid (does not conform to semver)!')
       }
     }
 
